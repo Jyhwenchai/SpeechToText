@@ -67,4 +67,64 @@ public struct RecognitionResult: Sendable, Equatable {
     self.segments = segments
     self.locale = locale
   }
+  
+  /// 格式化后的识别文本（添加智能标点符号）
+  /// 
+  /// 基于时间片段信息自动添加标点符号，提升文本可读性。
+  /// 
+  /// ## 特性
+  /// - 自动检测中英文，使用相应标点符号
+  /// - 根据停顿时长智能添加逗号、分号、句号
+  /// - 保留并优化原有标点符号，不重复添加
+  /// - **不插入换行符**，仅添加标点
+  /// - 不改变原词序和语义
+  /// 
+  /// ## 配置
+  /// 使用默认配置 `PunctuationRecoveryOptions.default`。
+  /// 如需自定义配置，请使用 `formattedText(with:)` 方法。
+  /// 
+  /// ## 示例
+  /// ```swift
+  /// let result = try await transcriber.transcribe(fileURL: url, config: .chinese)
+  /// print("原始文本：", result.text)
+  /// print("格式化文本：", result.formattedText)
+  /// ```
+  /// 
+  /// - Note: 如果 segments 为空或 nil，返回原始 text
+  @available(iOS 13.0, macOS 10.15, *)
+  public var formattedText: String {
+    formattedText(with: .default)
+  }
+  
+  /// 格式化文本（带标点）
+  /// - Parameter options: 标点符号恢复配置
+  /// - Returns: 格式化后的文本
+  @available(iOS 13.0, macOS 10.15, *)
+  public func formattedText(with options: PunctuationRecoveryOptions) -> String {
+    // 检查配置是否启用
+    guard options.enabled else {
+      return text
+    }
+    
+    // 检查是否有 segments
+    guard let segments = segments, !segments.isEmpty else {
+      return text
+    }
+    
+    // 将 RecognitionSegment 转换为 TextFormatter.SegmentProxy
+    let proxies = segments.map { segment in
+      TextFormatter.SegmentProxy(
+        text: segment.text,
+        start: segment.timestamp,
+        end: segment.timestamp + segment.duration
+      )
+    }
+    
+    // 调用 TextFormatter 格式化
+    return TextFormatter.formatSync(
+      text: text,
+      segments: proxies,
+      options: options
+    )
+  }
 }

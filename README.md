@@ -12,6 +12,8 @@
 ## ✨ 特性
 
 - ✅ **音频文件转文本**：支持将本地音频文件转换为文本
+- ✅ **智能标点恢复**：基于 NLLanguage 语义分析和停顿时长智能添加标点符号
+- ✅ **诗词断句支持**：专门为古诗词、现代诗优化的断句策略
 - ✅ **权限管理**：自动处理语音识别权限申请
 - ✅ **多语言支持**：支持中文、英文等多种语言识别
 - ✅ **完善的错误处理**：提供详细的错误类型和恢复建议
@@ -149,7 +151,78 @@ let result = try await transcriber.transcribe(
 let config = RecognitionConfig(
     locale: Locale(identifier: "zh-CN"),           // 语言
     requiresOnDeviceRecognition: false,            // 是否使用离线识别
-    taskHint: .dictation                           // 任务类型提示
+    taskHint: .dictation,                          // 任务类型提示
+    punctuationRecovery: .default                  // 标点符号恢复配置
+)
+```
+
+### 标点符号恢复
+
+SpeechToTextKit 提供智能标点符号恢复功能，基于 Natural Language 语义分析和停顿时长智能添加标点。
+
+#### 默认模式
+
+```swift
+let config = RecognitionConfig(
+    locale: Locale(identifier: "zh-CN"),
+    punctuationRecovery: .default  // 基于停顿时长添加标点
+)
+
+let result = try await transcriber.transcribe(fileURL: audioURL, config: config)
+print(result.formattedText)  // 带标点的文本
+```
+
+#### 诗词模式
+
+专门为古诗词、现代诗优化的断句策略：
+
+```swift
+let config = RecognitionConfig(
+    locale: Locale(identifier: "zh-CN"),
+    punctuationRecovery: .poetry  // 诗词断句模式
+)
+
+let result = try await transcriber.transcribe(fileURL: audioURL, config: config)
+// 输入：“床前明月光疑是地上霜举头望明月低头思故乡”
+// 输出：“床前明月光。疑是地上霜。举头望明月。低头思故乡。”
+```
+
+#### 纯语义模式
+
+适用于没有时间信息或时间信息不准确的场景：
+
+```swift
+let config = RecognitionConfig(
+    locale: Locale(identifier: "zh-CN"),
+    punctuationRecovery: .semanticOnly  // 忽略停顿，仅依赖语义分析
+)
+
+let result = try await transcriber.transcribe(fileURL: audioURL, config: config)
+```
+
+#### 禁用标点恢复
+
+```swift
+let config = RecognitionConfig(
+    locale: Locale(identifier: "zh-CN"),
+    punctuationRecovery: nil  // 不添加标点
+)
+```
+
+#### 自定义标点配置
+
+```swift
+let customOptions = PunctuationRecoveryOptions(
+    enabled: true,
+    shortPauseThreshold: 0.5,      // 短停顿阈值（逗号）
+    longPauseThreshold: 1.0,       // 长停顿阈值（句号）
+    enableSemanticMode: false,     // 是否启用语义模式
+    minWordsForSentence: 5         // 句子最小词数
+)
+
+let config = RecognitionConfig(
+    locale: Locale(identifier: "zh-CN"),
+    punctuationRecovery: customOptions
 )
 ```
 
@@ -215,6 +288,9 @@ public struct RecognitionConfig {
     
     /// 任务提示类型
     public let taskHint: TaskHint
+    
+    /// 标点符号恢复配置
+    public let punctuationRecovery: PunctuationRecoveryOptions?
 }
 ```
 
@@ -222,24 +298,66 @@ public struct RecognitionConfig {
 - `.chinese`: 中文识别配置
 - `.english`: 英文识别配置
 
+### PunctuationRecoveryOptions
+
+标点符号恢复配置
+
+```swift
+public struct PunctuationRecoveryOptions {
+    /// 是否启用标点符号恢复
+    public let enabled: Bool
+    
+    /// 短停顿阈值（秒）- 逗号
+    public let shortPauseThreshold: Double
+    
+    /// 长停顿阈值（秒）- 句号
+    public let longPauseThreshold: Double
+    
+    /// 是否启用纯语义模式
+    public let enableSemanticMode: Bool
+    
+    /// 语义模式下的最小词语数
+    public let minWordsForSentence: Int
+}
+```
+
+**预定义配置：**
+- `.default`: 默认模式，基于停顿时长添加标点
+- `.poetry`: 诗词模式，适用于古诗词、现代诗
+- `.semanticOnly`: 纯语义模式，忽略停顿时长
+
 ### RecognitionResult
 
 识别结果
 
 ```swift
 public struct RecognitionResult {
-    /// 完整识别文本
+    /// 原始识别文本（无标点）
     public let text: String
+    
+    /// 格式化后的文本（带标点）
+    public let formattedText: String
     
     /// 总体置信度 (0.0 - 1.0)
     public let confidence: Double?
     
     /// 文本片段详情
-    public let segments: [RecognitionSegment]?
+    public let segments: [RecognitionSegment]
     
     /// 识别所用语言
     public let locale: Locale?
 }
+```
+
+**使用示例：**
+```swift
+let result = try await transcriber.transcribe(fileURL: audioURL, config: config)
+
+// 使用格式化后的文本（带标点）
+print(result.formattedText)  // "床前明月光。疑是地上霜。"
+
+// 使用原始文本（无标点）
+print(result.text)           // "床前明月光疑是地上霜"
 ```
 
 ### RecognitionError
