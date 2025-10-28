@@ -28,7 +28,8 @@ public actor SpeechPermissionManager: SpeechPermissionManaging {
   public func request() async -> SpeechPermissionStatus {
     await withCheckedContinuation { continuation in
       SFSpeechRecognizer.requestAuthorization { authStatus in
-        let status = self.mapAuthorizationStatus(authStatus)
+        // 使用静态方法避免 actor 隔离问题
+        let status = Self.mapAuthorizationStatusStatic(authStatus)
         continuation.resume(returning: status)
       }
     }
@@ -38,6 +39,14 @@ public actor SpeechPermissionManager: SpeechPermissionManaging {
   
   /// 将系统权限状态映射到业务权限状态
   nonisolated private func mapAuthorizationStatus(
+    _ authStatus: SFSpeechRecognizerAuthorizationStatus
+  ) -> SpeechPermissionStatus {
+    Self.mapAuthorizationStatusStatic(authStatus)
+  }
+  
+  /// 静态方法：将系统权限状态映射到业务权限状态
+  /// 用于在闭包中使用，避免 actor 隔离问题
+  nonisolated private static func mapAuthorizationStatusStatic(
     _ authStatus: SFSpeechRecognizerAuthorizationStatus
   ) -> SpeechPermissionStatus {
     switch authStatus {
