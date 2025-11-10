@@ -52,3 +52,25 @@ public protocol SpeechFileTranscribing: Sendable {
     config: RecognitionConfig
   ) async throws -> RecognitionResult
 }
+
+#if os(iOS) && canImport(Speech)
+/// 实时语音转写协议（仅 iOS 可用）
+@available(iOS 13.0, *)
+@MainActor
+public protocol SpeechRealtimeTranslating: AnyObject {
+  /// 实时识别回调
+  typealias ResultHandler = (RecognitionResult, Bool) -> Void
+  
+  /// 识别结果回调，`Bool` 表示是否为最终结果
+  var onResult: ResultHandler? { get set }
+  
+  /// 错误回调
+  var onError: ((Error) -> Void)? { get set }
+  
+  /// 开始实时识别
+  func start() async throws
+  
+  /// 停止实时识别并清理资源
+  func stop()
+}
+#endif

@@ -12,6 +12,7 @@
 ## ✨ 特性
 
 - ✅ **音频文件转文本**：支持将本地音频文件转换为文本
+- ✅ **实时语音翻译**：支持内建麦克风模式与外部 PCM 流数据，实时返回部分/最终结果
 - ✅ **智能标点恢复**：基于 NLLanguage 语义分析和停顿时长智能添加标点符号
 - ✅ **诗词断句支持**：专门为古诗词、现代诗优化的断句策略
 - ✅ **权限管理**：自动处理语音识别权限申请
@@ -66,7 +67,7 @@ dependencies: [
 
 ### Info.plist 权限配置
 
-在您的应用的 `Info.plist` 文件中添加语音识别权限说明：
+在您的应用的 `Info.plist` 中添加语音识别权限说明：
 
 ```xml
 <key>NSSpeechRecognitionUsageDescription</key>
@@ -80,7 +81,14 @@ dependencies: [
 <string>需要访问语音识别功能以将您的音频转换为文本</string>
 ```
 
-> **注意**：此库仅需要语音识别权限，不需要麦克风权限（因为仅处理音频文件）
+启用实时语音翻译时，还需要声明麦克风权限：
+
+```xml
+<key>NSMicrophoneUsageDescription</key>
+<string>需要访问麦克风以实时识别您的语音</string>
+```
+
+> **注意**：仅进行离线文件转写时可以不请求麦克风权限；实时语音翻译必须同时获得语音识别和麦克风权限。
 
 ## 🚀 使用方法
 
@@ -155,6 +163,89 @@ let config = RecognitionConfig(
     punctuationRecovery: .default                  // 标点符号恢复配置
 )
 ```
+
+### 实时语音翻译
+
+#### 方案一：直接使用麦克风
+
+```swift
+import SpeechToTextKit
+
+@MainActor
+final class LiveTranscriber {
+    private lazy var translator = RealtimeSpeechTranslator(
+        config: .chinese,
+        inputSource: .microphone
+    )
+
+    init() {
+        translator.onResult = { result, isFinal in
+            print("实时文本：", result.text, isFinal ? "(最终)" : "(临时)")
+        }
+        translator.onError = { error in
+            print("实时识别失败：", error)
+        }
+    }
+
+    func start() {
+        Task {
+            do {
+                try await translator.start()
+            } catch {
+                print("无法启动实时识别：\(error)")
+            }
+        }
+    }
+
+    func stop() {
+        translator.stop()
+    }
+}
+```
+
+> `RealtimeSpeechTranslator` 仅适用于 iOS。该方案下库会自动拉起麦克风权限，请确保 `NSSpeechRecognitionUsageDescription` 与 `NSMicrophoneUsageDescription` 均已声明。
+
+#### 方案二：接入自定义录音器（示例使用 `AudioRecorder`）
+
+当你已有一套录音组件并希望复用其 PCM 数据时，可以让 `RealtimeSpeechTranslator` 以 `.external` 模式工作，然后在录音回调里把 PCM 缓冲推送给识别器：
+
+```swift
+import Combine
+import SpeechToTextKit
+
+final class ExternalLiveDemo {
+    private let recorder = AudioRecorder(format: .m4a)
+    private lazy var translator = RealtimeSpeechTranslator(
+        config: .chinese,
+        inputSource: .external
+    )
+    private var cancellable: AnyCancellable?
+
+    func start() {
+        translator.onResult = { result, isFinal in
+            print("文本：", isFinal ? result.formattedText : result.text)
+        }
+
+        Task {
+            try await translator.start()
+            cancellable = recorder.realtimeChunkPublisher
+                .compactMap { $0.makePCMBuffer() }
+                .sink { [weak self] buffer in
+                    self?.translator.appendExternalBuffer(buffer)
+                }
+            try recorder.start()
+        }
+    }
+
+    func stop() {
+        recorder.stop()
+        translator.stop()
+        cancellable?.cancel()
+    }
+}
+```
+
+`AudioRecorder.RealtimeAudioChunk.makePCMBuffer()` 的实现示例可参考 `Example-UIKit/Example-UIKit/ViewController.swift`，示例 App 也提供了完整的 UI 流程与录音存档。
 
 ### 标点符号恢复
 
@@ -425,6 +516,7 @@ iOS Speech Framework 支持以下音频格式：
 1. 确保 `Info.plist` 中已添加 `NSSpeechRecognitionUsageDescription`
 2. 引导用户到系统设置中手动开启权限
 3. 提供清晰的权限说明和使用场景
+4. 使用实时语音翻译时，同时确认 `NSMicrophoneUsageDescription` 已声明且麦克风权限已授予
 
 ### 服务不可用
 
@@ -445,6 +537,8 @@ iOS Speech Framework 支持以下音频格式：
 cd SpeechToText
 open Example-UIKit/Example-UIKit.xcodeproj
 ```
+
+- 示例首页新增 “实时语音翻译” 区域，展示如何同时录音、保存文件并把 PCM 数据流式发送给 `RealtimeSpeechTranslator`。
 
 ## 🤝 贡献
 

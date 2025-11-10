@@ -157,12 +157,14 @@
 				DEVELOPMENT_TEAM = DTH85SS4GJ;
 				GENERATE_INFOPLIST_FILE = YES;
 				INFOPLIST_FILE = "Example-UIKit/Info.plist";
-				INFOPLIST_KEY_NSSpeechRecognitionUsageDescription = "语音识别用于将音频文件转换为文本";
+				INFOPLIST_KEY_NSMicrophoneUsageDescription = 123;
+				INFOPLIST_KEY_NSSpeechRecognitionUsageDescription = "需要访问语音识别功能以将您的音频文件转换为文本";
 				INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents = YES;
 				INFOPLIST_KEY_UILaunchStoryboardName = LaunchScreen;
 				INFOPLIST_KEY_UIMainStoryboardFile = Main;
 				INFOPLIST_KEY_UISupportedInterfaceOrientations_iPad = "UIInterfaceOrientationPortrait UIInterfaceOrientationPortraitUpsideDown UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight";
 				INFOPLIST_KEY_UISupportedInterfaceOrientations_iPhone = "UIInterfaceOrientationPortrait UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight";
+				INFOPLIST_KEY_UISupportsDocumentBrowser = YES;
 				IPHONEOS_DEPLOYMENT_TARGET = 13.0;
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
@@ -194,12 +196,14 @@
 				DEVELOPMENT_TEAM = DTH85SS4GJ;
 				GENERATE_INFOPLIST_FILE = YES;
 				INFOPLIST_FILE = "Example-UIKit/Info.plist";
-				INFOPLIST_KEY_NSSpeechRecognitionUsageDescription = "语音识别用于将音频文件转换为文本";
+				INFOPLIST_KEY_NSMicrophoneUsageDescription = 123;
+				INFOPLIST_KEY_NSSpeechRecognitionUsageDescription = "需要访问语音识别功能以将您的音频文件转换为文本";
 				INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents = YES;
 				INFOPLIST_KEY_UILaunchStoryboardName = LaunchScreen;
 				INFOPLIST_KEY_UIMainStoryboardFile = Main;
 				INFOPLIST_KEY_UISupportedInterfaceOrientations_iPad = "UIInterfaceOrientationPortrait UIInterfaceOrientationPortraitUpsideDown UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight";
 				INFOPLIST_KEY_UISupportedInterfaceOrientations_iPhone = "UIInterfaceOrientationPortrait UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight";
+				INFOPLIST_KEY_UISupportsDocumentBrowser = YES;
 				IPHONEOS_DEPLOYMENT_TARGET = 13.0;
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",

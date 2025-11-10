@@ -65,7 +65,7 @@ public actor SpeechFileTranscriber: SpeechFileTranscribing {
   
   /// 确保权限已授权
   private func ensurePermissionAuthorized() async throws {
-    let status = await permissionManager.status()
+    let status = permissionManager.status()
     
     switch status {
     case .authorized:
@@ -93,7 +93,7 @@ public actor SpeechFileTranscriber: SpeechFileTranscribing {
     let request = SFSpeechURLRecognitionRequest(url: fileURL)
     request.shouldReportPartialResults = false
     request.requiresOnDeviceRecognition = config.requiresOnDeviceRecognition
-    request.taskHint = mapTaskHint(config.taskHint)
+    request.taskHint = config.taskHint.speechTaskHint
     
     let locale = config.locale
     return try await withCheckedThrowingContinuation { continuation in
@@ -106,7 +106,7 @@ public actor SpeechFileTranscriber: SpeechFileTranscribing {
         // 处理错误
         if let error = error {
           hasResumed = true
-          let mappedError = Self.mapErrorStatic(error)
+          let mappedError = SpeechRecognitionHelpers.mapError(error)
           continuation.resume(throwing: mappedError)
           return
         }
@@ -114,7 +114,7 @@ public actor SpeechFileTranscriber: SpeechFileTranscribing {
         // 处理最终结果
         if let result = result, result.isFinal {
           hasResumed = true
-          let recognitionResult = Self.buildResultStatic(from: result, locale: locale)
+          let recognitionResult = SpeechRecognitionHelpers.buildResult(from: result, locale: locale)
           continuation.resume(returning: recognitionResult)
         }
       }
@@ -127,83 +127,6 @@ public actor SpeechFileTranscriber: SpeechFileTranscribing {
     }
   }
   
-  /// 构建识别结果
-  private nonisolated static func buildResultStatic(
-    from sfResult: SFSpeechRecognitionResult,
-    locale: Locale
-  ) -> RecognitionResult {
-    let transcription = sfResult.bestTranscription
-    let text = transcription.formattedString
-    
-    // 计算平均置信度
-    let confidence: Double? = {
-      let segments = transcription.segments
-      guard !segments.isEmpty else { return nil }
-      let sum = segments.reduce(0.0) { $0 + Double($1.confidence) }
-      return sum / Double(segments.count)
-    }()
-    
-    // 构建片段信息
-    let segments: [RecognitionSegment]? = {
-      let sfSegments = transcription.segments
-      guard !sfSegments.isEmpty else { return nil }
-      
-      return sfSegments.map { segment in
-        RecognitionSegment(
-          text: segment.substring,
-          timestamp: segment.timestamp,
-          duration: segment.duration,
-          confidence: Double(segment.confidence)
-        )
-      }
-    }()
-    
-    return RecognitionResult(
-      text: text,
-      confidence: confidence,
-      segments: segments,
-      locale: locale
-    )
-  }
-  
-  /// 映射任务提示
-  private func mapTaskHint(_ hint: TaskHint) -> SFSpeechRecognitionTaskHint {
-    switch hint {
-    case .unspecified:
-      return .unspecified
-    case .dictation:
-      return .dictation
-    case .search:
-      return .search
-    case .confirmation:
-      return .confirmation
-    }
-  }
-  
-  /// 映射系统错误到业务错误
-  private nonisolated static func mapErrorStatic(_ error: Error) -> RecognitionError {
-    let nsError = error as NSError
-    
-    // 检查取消错误
-    if nsError.domain == NSCocoaErrorDomain && nsError.code == NSUserCancelledError {
-      return .cancelled
-    }
-    
-    // 检查语音识别相关错误
-    if nsError.domain == "kAFAssistantErrorDomain" {
-      switch nsError.code {
-      case 1100, 1101: // 权限相关
-        return .denied
-      case 203, 216: // 网络或服务不可用
-        return .notAvailable
-      default:
-        return .underlying(message: nsError.localizedDescription)
-      }
-    }
-    
-    // 默认包装为底层错误
-    return .underlying(message: error.localizedDescription)
-  }
 }
 
 #else

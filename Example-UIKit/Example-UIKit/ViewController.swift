@@ -5,6 +5,8 @@
 //  SpeechToTextKit 示例应用 - 使用 Frame 布局
 //
 
+import AVFoundation
+import Combine
 import SpeechToTextKit
 import UIKit
 import UniformTypeIdentifiers
@@ -15,9 +17,21 @@ class ViewController: UIViewController {
 
   private let permissionManager = SpeechPermissionManager()
   private let transcriber = SpeechFileTranscriber()
+  private let audioRecorder = AudioRecorder(format: .m4a)
+  private lazy var realtimeTranslator = RealtimeSpeechTranslator(
+    config: .chinese,
+    permissionManager: permissionManager,
+    inputSource: .external
+  )
+  
+  private var realtimeChunkCancellable: AnyCancellable?
+  private var realtimeStatusCancellable: AnyCancellable?
+  
   private var isProcessing = false
   private var currentResult: RecognitionResult?
   private var isFormattedMode = true  // 默认显示格式化文本
+  private var isRealtimeRunning = false
+  private var realtimeText: String = ""
 
   // MARK: - UI Components
 
@@ -119,6 +133,62 @@ class ViewController: UIViewController {
     return view
   }()
 
+  private lazy var realtimeContainerView: UIView = {
+    let view = UIView()
+    view.backgroundColor = UIColor.systemGray6
+    view.layer.cornerRadius = 12
+    view.layer.borderColor = UIColor.systemGray4.cgColor
+    view.layer.borderWidth = 1
+    return view
+  }()
+
+  private lazy var realtimeTitleLabel: UILabel = {
+    let label = UILabel()
+    label.text = "实时语音翻译（麦克风）"
+    label.font = UIFont.systemFont(ofSize: 18, weight: .semibold)
+    return label
+  }()
+
+  private lazy var realtimeStatusLabel: UILabel = {
+    let label = UILabel()
+    label.font = UIFont.systemFont(ofSize: 14, weight: .medium)
+    label.textColor = .secondaryLabel
+    label.numberOfLines = 0
+    label.text = "点击下方按钮开始录音并实时翻译"
+    return label
+  }()
+
+  private lazy var realtimeRecordingLabel: UILabel = {
+    let label = UILabel()
+    label.font = UIFont.systemFont(ofSize: 13, weight: .regular)
+    label.textColor = .secondaryLabel
+    label.text = ""
+    return label
+  }()
+
+  private lazy var realtimeToggleButton: UIButton = {
+    let button = UIButton(type: .system)
+    button.setTitle("开始实时翻译", for: .normal)
+    button.titleLabel?.font = UIFont.systemFont(ofSize: 16, weight: .semibold)
+    button.backgroundColor = UIColor.systemPink
+    button.setTitleColor(.white, for: .normal)
+    button.layer.cornerRadius = 10
+    button.addTarget(self, action: #selector(realtimeButtonTapped), for: .touchUpInside)
+    return button
+  }()
+
+  private lazy var realtimeTextView: UITextView = {
+    let textView = UITextView()
+    textView.font = UIFont.systemFont(ofSize: 15, weight: .regular)
+    textView.textColor = .secondaryLabel
+    textView.backgroundColor = UIColor.systemBackground
+    textView.layer.cornerRadius = 10
+    textView.text = "实时识别结果将在此显示"
+    textView.isEditable = false
+    textView.textContainerInset = UIEdgeInsets(top: 12, left: 12, bottom: 12, right: 12)
+    return textView
+  }()
+
   private lazy var resultTitleLabel: UILabel = {
     let label = UILabel()
     label.text = "识别结果："
@@ -165,7 +235,15 @@ class ViewController: UIViewController {
 
   override func viewDidLoad() {
     super.viewDidLoad()
+    navigationItem.title = "SpeechToTextKit"
+    navigationItem.rightBarButtonItem = UIBarButtonItem(
+      title: "测试面板",
+      style: .plain,
+      target: self,
+      action: #selector(openTestController)
+    )
     setupUI()
+    configureRealtimeDemo()
     updatePermissionStatus()
     Task {
       guard
@@ -222,11 +300,37 @@ class ViewController: UIViewController {
     scrollView.addSubview(selectFileButton)
     scrollView.addSubview(activityIndicator)
     scrollView.addSubview(statusLabel)
+    scrollView.addSubview(realtimeContainerView)
     scrollView.addSubview(resultContainerView)
     resultContainerView.addSubview(resultTitleLabel)
     resultContainerView.addSubview(textModeControl)
     resultContainerView.addSubview(resultTextView)
     resultContainerView.addSubview(confidenceLabel)
+    realtimeContainerView.addSubview(realtimeTitleLabel)
+    realtimeContainerView.addSubview(realtimeStatusLabel)
+    realtimeContainerView.addSubview(realtimeRecordingLabel)
+    realtimeContainerView.addSubview(realtimeToggleButton)
+    realtimeContainerView.addSubview(realtimeTextView)
+  }
+  
+  private func configureRealtimeDemo() {
+    realtimeTranslator.onResult = { [weak self] result, isFinal in
+      self?.handleRealtimeResult(result: result, isFinal: isFinal)
+    }
+    
+    realtimeTranslator.onError = { [weak self] error in
+      let recognitionError = error as? RecognitionError
+        ?? .underlying(message: error.localizedDescription)
+      self?.presentRealtimeError(recognitionError)
+    }
+    
+    realtimeStatusCancellable = audioRecorder.statusChangedPublisher
+      .receive(on: DispatchQueue.main)
+      .sink { [weak self] status in
+        self?.handleRecorderStatus(status)
+      }
+    
+    updateRealtimeUI(status: "点击下方按钮开始录音并实时翻译")
   }
 
   private func layoutViews() {
@@ -330,6 +434,64 @@ class ViewController: UIViewController {
       height: max(20, statusTextSize.height)
     )
     yOffset += max(20, statusTextSize.height) + 20
+    
+    // Realtime Demo Container
+    let realtimeStatusSize = realtimeStatusLabel.sizeThatFits(
+      CGSize(width: contentWidth - 32, height: .greatestFiniteMagnitude)
+    )
+    let realtimeRecordingSize = realtimeRecordingLabel.sizeThatFits(
+      CGSize(width: contentWidth - 32, height: .greatestFiniteMagnitude)
+    )
+    let realtimeTextHeight: CGFloat = 150
+    let realtimeContainerHeight =
+      16 + 24 + 12 + 44 + 12
+      + realtimeStatusSize.height
+      + 4 + max(18, realtimeRecordingSize.height)
+      + 12 + realtimeTextHeight + 16
+    
+    realtimeContainerView.frame = CGRect(
+      x: padding,
+      y: yOffset,
+      width: contentWidth,
+      height: realtimeContainerHeight
+    )
+    
+    realtimeTitleLabel.frame = CGRect(
+      x: 16,
+      y: 16,
+      width: contentWidth - 32,
+      height: 24
+    )
+    
+    realtimeToggleButton.frame = CGRect(
+      x: 16,
+      y: realtimeTitleLabel.frame.maxY + 12,
+      width: contentWidth - 32,
+      height: 44
+    )
+    
+    realtimeStatusLabel.frame = CGRect(
+      x: 16,
+      y: realtimeToggleButton.frame.maxY + 12,
+      width: contentWidth - 32,
+      height: realtimeStatusSize.height
+    )
+    
+    realtimeRecordingLabel.frame = CGRect(
+      x: 16,
+      y: realtimeStatusLabel.frame.maxY + 4,
+      width: contentWidth - 32,
+      height: max(18, realtimeRecordingSize.height)
+    )
+    
+    realtimeTextView.frame = CGRect(
+      x: 16,
+      y: realtimeRecordingLabel.frame.maxY + 12,
+      width: contentWidth - 32,
+      height: realtimeTextHeight
+    )
+    
+    yOffset += realtimeContainerHeight + 20
 
     // Result Container View
     if !resultContainerView.isHidden {
@@ -383,6 +545,13 @@ class ViewController: UIViewController {
     // Update ScrollView content size
     scrollView.contentSize = CGSize(width: width, height: yOffset)
   }
+  
+  override func viewWillDisappear(_ animated: Bool) {
+    super.viewWillDisappear(animated)
+    stopRealtimeTranslation()
+    realtimeStatusCancellable?.cancel()
+    realtimeStatusCancellable = nil
+  }
 
   // MARK: - Permission Management
 
@@ -433,6 +602,11 @@ class ViewController: UIViewController {
       }
     }
   }
+  
+  @objc private func openTestController() {
+    let controller = TestViewController()
+    navigationController?.pushViewController(controller, animated: true)
+  }
 
   // MARK: - File Selection
 
@@ -462,6 +636,14 @@ class ViewController: UIViewController {
     documentPicker.modalPresentationStyle = .formSheet
 
     present(documentPicker, animated: true)
+  }
+  
+  @objc private func realtimeButtonTapped() {
+    if isRealtimeRunning {
+      stopRealtimeTranslation()
+    } else {
+      startRealtimeTranslation()
+    }
   }
 
   // MARK: - Transcription
@@ -558,6 +740,123 @@ class ViewController: UIViewController {
     )
     alert.addAction(UIAlertAction(title: "确定", style: .default))
     present(alert, animated: true)
+  }
+
+  // MARK: - Realtime Translation
+  
+  private func startRealtimeTranslation() {
+    guard !isRealtimeRunning else { return }
+    realtimeToggleButton.isEnabled = false
+    realtimeText = ""
+    realtimeRecordingLabel.text = ""
+    updateRealtimeUI(status: "正在启动实时翻译...", textColor: .systemBlue)
+    
+    Task { @MainActor [weak self] in
+      guard let self else { return }
+      do {
+        try await realtimeTranslator.start()
+        
+        realtimeChunkCancellable?.cancel()
+        realtimeChunkCancellable = audioRecorder.realtimeChunkPublisher
+          .receive(on: DispatchQueue.main)
+          .sink { [weak self] chunk in
+            self?.handleRealtimeChunk(chunk)
+          }
+        
+        try audioRecorder.start()
+        
+        self.isRealtimeRunning = true
+        self.realtimeToggleButton.isEnabled = true
+        self.updateRealtimeUI(status: "🎙️ 正在录音，开口说话吧！", textColor: .systemGreen)
+      } catch let error as RecognitionError {
+        self.realtimeToggleButton.isEnabled = true
+        self.realtimeTranslator.stop()
+        self.presentRealtimeError(error)
+      } catch {
+        self.realtimeToggleButton.isEnabled = true
+        self.realtimeTranslator.stop()
+        self.presentRealtimeError(.underlying(message: error.localizedDescription))
+      }
+    }
+  }
+  
+  private func stopRealtimeTranslation() {
+    audioRecorder.stop()
+    realtimeTranslator.stop()
+    realtimeChunkCancellable?.cancel()
+    realtimeChunkCancellable = nil
+    isRealtimeRunning = false
+    updateRealtimeUI(status: "已停止，点击开始重新录音", textColor: .secondaryLabel)
+  }
+  
+  private func handleRealtimeChunk(_ chunk: AudioRecorder.RealtimeAudioChunk) {
+    guard let buffer = chunk.makePCMBuffer() else { return }
+    realtimeTranslator.appendExternalBuffer(buffer)
+  }
+  
+  private func handleRealtimeResult(result: RecognitionResult, isFinal: Bool) {
+    realtimeText = isFinal ? result.formattedText : result.text
+    let statusText = isFinal ? "✅ 已识别一句，可继续讲话" : "🎧 正在识别..."
+    updateRealtimeUI(status: statusText, textColor: .systemBlue)
+  }
+  
+  private func handleRecorderStatus(_ status: AudioRecorder.Status) {
+    switch status {
+    case .starting:
+      realtimeRecordingLabel.text = "🎤 正在准备录音..."
+    case .progress(let seconds):
+      realtimeRecordingLabel.text = "录音长度：\(Int(seconds)) 秒"
+    case .completion(let url):
+      realtimeRecordingLabel.text = "已保存：\(url.lastPathComponent)"
+    case .failure(let error):
+      realtimeRecordingLabel.text = "录音失败：\(error.localizedDescription)"
+      stopRealtimeTranslation()
+    case .cancel:
+      realtimeRecordingLabel.text = "录音已取消"
+    }
+    view.setNeedsLayout()
+  }
+  
+  private func presentRealtimeError(_ error: RecognitionError) {
+    stopRealtimeTranslation()
+    realtimeStatusLabel.textColor = .systemRed
+    realtimeStatusLabel.text = "❌ \(error.localizedDescription)"
+    
+    let message = error.localizedDescription
+      + (error.recoverySuggestion.map { "\n\n\($0)" } ?? "")
+    let alert = UIAlertController(
+      title: "实时翻译失败",
+      message: message,
+      preferredStyle: .alert
+    )
+    alert.addAction(UIAlertAction(title: "确定", style: .default))
+    present(alert, animated: true)
+  }
+  
+  private func updateRealtimeUI(status: String? = nil, textColor: UIColor? = nil) {
+    if let status {
+      realtimeStatusLabel.text = status
+    }
+    if let textColor {
+      realtimeStatusLabel.textColor = textColor
+    } else {
+      realtimeStatusLabel.textColor = isRealtimeRunning ? .systemGreen : .secondaryLabel
+    }
+    
+    realtimeToggleButton.setTitle(
+      isRealtimeRunning ? "停止实时翻译" : "开始实时翻译",
+      for: .normal
+    )
+    
+    if realtimeText.isEmpty {
+      realtimeTextView.text = "实时识别结果将在此显示"
+      realtimeTextView.textColor = .secondaryLabel
+    } else {
+      realtimeTextView.text = realtimeText
+      realtimeTextView.textColor = .label
+    }
+    
+    view.setNeedsLayout()
   }
 
   private func updateDisplayedText() {
