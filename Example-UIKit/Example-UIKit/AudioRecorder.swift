@@ -1,33 +1,21 @@
 //
 //  AudioRecorder.swift
-//  TestVoiceRecorder
+//  Example-UIKit
 //
-//  Created by didong on 11/9/25.
-//
-
-
-//
-//  AudioRecorderDelegate.swift
-//  LuoboIM
-//
-//  Created by 蔡志文 on 3/5/25.
+//  完全基于 Swift Concurrency 的录音封装，提供状态/功率/实时 PCM 的异步流。
 //
 
-import Foundation
 import AVFoundation
-import Combine
+import Foundation
 
-// MARK: - 音频录制核心类
+public actor AudioRecorder {
 
-/// 高级录音封装：一边写文件、一边推送实时 PCM 数据，供离线与实时翻译同时使用。
-public final class AudioRecorder: NSObject, @unchecked Sendable {
-  // MARK: 配置参数
+  // MARK: - Nested Types
 
-  /// 输出文件格式（决定编码设置与扩展名）
   public enum AudioFormat: String, CaseIterable {
-    case m4a // AAC格式
-    case wav // PCM格式
-    case aiff // AIFF格式
+    case m4a
+    case wav
+    case aiff
 
     var fileType: AVFileType {
       switch self {
@@ -58,8 +46,7 @@ public final class AudioRecorder: NSObject, @unchecked Sendable {
     }
   }
 
-  /// 对外广播的状态，便于 UI 同步显示
-  public enum Status {
+  public enum Status: Sendable {
     case starting
     case progress(TimeInterval)
     case completion(saveURL: URL)
@@ -67,13 +54,11 @@ public final class AudioRecorder: NSObject, @unchecked Sendable {
     case cancel
   }
 
-  /// 用于波形显示/音量门限判断
   public struct Power: Sendable {
     public let average: Float
     public let peak: Float
   }
 
-  /// tap Buffer 的 PCM 采样精度（Float32/Int16），实时翻译需要知道如何还原
   public enum SampleFormat: Sendable {
     case float32
     case int16
@@ -86,7 +71,6 @@ public final class AudioRecorder: NSObject, @unchecked Sendable {
     }
   }
 
-  // 实时翻译消费的 PCM 数据块，保持格式信息方便还原 AVAudioPCMBuffer
   public struct RealtimeAudioChunk: Sendable {
     public let data: Data
     public let sampleRate: Double
@@ -95,260 +79,304 @@ public final class AudioRecorder: NSObject, @unchecked Sendable {
     public let sampleFormat: SampleFormat
   }
 
-  /// 内部错误，便于更明确地抛出问题
   enum RecorderError: Error {
+    case alreadyRunning
     case permissionDenied
     case invalidFormat
-    case engineUnavailable
-    case fileWriteFailed
   }
 
-  // MARK: 属性
+  // MARK: - Public Configuration
 
-  /// 驱动麦克风输入、安装 tap 的核心引擎
-  private let audioEngine = AVAudioEngine()
-  /// 当前写入中的音频文件
-  private var audioFile: AVAudioFile?
-  /// 输入节点的 PCM 格式（单声道/采样率/位宽）
-  private var inputFormat: AVAudioFormat?
-  /// 录音生成的最终文件 URL
-  private var recordingFileURL: URL?
-  /// 记录开始时间，以便计算进度 & 超时
-  private var recordingStartTime: Date?
-  /// 处理 PCM、写文件的串行队列，避免竞态
-  private let streamingQueue = DispatchQueue(label: "com.testvoicerecorder.streaming")
-  private var recordingTimer: Timer?
-  private var currentRecordingTime: TimeInterval = 0
-  private var statusChangedSubject = PassthroughSubject<Status, Never>()
-  public var statusChangedPublisher: AnyPublisher<Status, Never> {
-    statusChangedSubject.eraseToAnyPublisher()
-  }
+  public var maxRecordingDuration: TimeInterval = 60
 
-  private var powerUpdatedSubject = PassthroughSubject<Power, Never>()
-  public var powerUpdatedPublisher: AnyPublisher<Power, Never> {
-    powerUpdatedSubject.eraseToAnyPublisher()
-  }
+  // MARK: - Private State
 
-  private var realtimeChunkSubject = PassthroughSubject<RealtimeAudioChunk, Never>()
-  public var realtimeChunkPublisher: AnyPublisher<RealtimeAudioChunk, Never> {
-    realtimeChunkSubject.eraseToAnyPublisher()
-  }
-
-  // 用户配置
-  var maxRecordingDuration: TimeInterval = 1 * 60 // 默认10分钟
-  private var saveDirectory: URL
+  private var engineDriver: AudioEngineDriver?
   private let format: AudioFormat
+  private var saveDirectory: URL
 
-  // MARK: 初始化
+  private var audioFile: AVAudioFile?
+  private var recordingFileURL: URL?
+  private var recordingStartTime: Date?
+  private var progressTask: Task<Void, Never>?
+  private var isRunning = false
+  private var currentRecordingTime: TimeInterval = 0
+
+  private var statusContinuations: [UUID: AsyncStream<Status>.Continuation] = [:]
+  private var powerContinuations: [UUID: AsyncStream<Power>.Continuation] = [:]
+  private var chunkContinuations: [UUID: AsyncStream<RealtimeAudioChunk>.Continuation] = [:]
+
+  // MARK: - Init
 
   public init(format: AudioFormat = .m4a) {
     self.format = format
-    saveDirectory = URL(fileURLWithPath: NSTemporaryDirectory())
-    super.init()
+    self.saveDirectory = URL(fileURLWithPath: NSTemporaryDirectory())
   }
 
-  // MARK: 核心控制方法
-  /// 录音权限校验（同步版，便于在 UIKit 按钮里快速判断）
-  public func checkRecordPermission() -> Bool {
-    if AVAudioSession.sharedInstance().recordPermission == .granted {
-      return true
-    }
-
-    AVAudioSession.sharedInstance().requestRecordPermission { _ in }
-    return false
+  deinit {
+    progressTask?.cancel()
+    statusContinuations.values.forEach { $0.finish() }
+    powerContinuations.values.forEach { $0.finish() }
+    chunkContinuations.values.forEach { $0.finish() }
   }
-//  func checkRecordPermission() async -> Bool {
-//    await withCheckedContinuation { continuation in
-//      if AVAudioSession.sharedInstance().recordPermission == .granted {
-//        continuation.resume(returning: true)
-//        return
-//      }
-//      AVAudioSession.sharedInstance().requestRecordPermission { granted in
-//        continuation.resume(returning: granted)
-//      }
-//    }
-//  }
 
-  /// 开始录音（创建目录 -> 配置 AudioSession -> 启动 Engine）
-  public func start(with saveDirectory: URL? = .none) throws {
-    if let saveDirectory {
-      self.saveDirectory = saveDirectory
+  // MARK: - Async Streams
+
+  public func statusUpdates() -> AsyncStream<Status> {
+    AsyncStream { continuation in
+      let id = UUID()
+      self.statusContinuations[id] = continuation
+      continuation.onTermination = { [weak self] _ in
+        guard let self else { return }
+        Task { await self.removeStatusContinuation(id) }
+      }
     }
-    createFileDirectory()
+  }
 
-    guard checkRecordPermission() else {
-      throw RecorderError.permissionDenied
+  public func powerUpdates() -> AsyncStream<Power> {
+    AsyncStream { continuation in
+      let id = UUID()
+      self.powerContinuations[id] = continuation
+      continuation.onTermination = { [weak self] _ in
+        guard let self else { return }
+        Task { await self.removePowerContinuation(id) }
+      }
     }
+  }
 
-    let fileName = "recording_\(Int(Date().timeIntervalSince1970)).\(format.rawValue)"
-    let fileURL = self.saveDirectory.appendingPathComponent(fileName)
+  public func realtimeChunks() -> AsyncStream<RealtimeAudioChunk> {
+    AsyncStream { continuation in
+      let id = UUID()
+      self.chunkContinuations[id] = continuation
+      continuation.onTermination = { [weak self] _ in
+        guard let self else { return }
+        Task { await self.removeChunkContinuation(id) }
+      }
+    }
+  }
+
+  private func removeStatusContinuation(_ id: UUID) {
+    statusContinuations.removeValue(forKey: id)
+  }
+
+  private func removePowerContinuation(_ id: UUID) {
+    powerContinuations.removeValue(forKey: id)
+  }
+
+  private func removeChunkContinuation(_ id: UUID) {
+    chunkContinuations.removeValue(forKey: id)
+  }
+
+  // MARK: - Control
+
+  public func start(with saveDirectory: URL? = nil) async throws {
+    guard !isRunning else { throw RecorderError.alreadyRunning }
+
+    if let saveDirectory { self.saveDirectory = saveDirectory }
+    try createFileDirectory()
+    try await ensureRecordPermission()
+
+    let fileURL = makeRecordingURL()
     recordingFileURL = fileURL
 
-    try configureSession()
-    try prepareEngine(for: fileURL)
-
-    recordingStartTime = Date()
-    startTimers()
-    try audioEngine.start()
-
-    emitStatus(.starting)
-  }
-
-  /// 停止录音并保存
-  public func stop() {
-    guard audioEngine.isRunning else {
-      cleanup()
-      return
+    // Initialize engineDriver on MainActor if needed
+    if engineDriver == nil {
+      engineDriver = await MainActor.run { AudioEngineDriver() }
     }
-    audioEngine.stop()
-    audioEngine.inputNode.removeTap(onBus: 0)
-    finishRecording(sendCompletion: true)
-  }
 
-  /// 取消录音并删除文件
-  public func cancel() {
-    audioEngine.stop()
-    audioEngine.inputNode.removeTap(onBus: 0)
-    if let recordingFileURL, FileManager.default.fileExists(atPath: recordingFileURL.path) {
-      try? FileManager.default.removeItem(at: recordingFileURL)
+    guard let driver = engineDriver else {
+      throw RecorderError.invalidFormat
     }
-    finishRecording(sendCompletion: false)
-    emitStatus(.cancel)
-  }
 
-  // MARK: 定时器管理
-
-  /// 两个定时器：1) 更新功率 2) 记录录音时长
-  private func startTimers() {
-    // 功率更新定时器（每0.1秒更新）
-    // 录音时长定时器
-    currentRecordingTime = 0
-    recordingTimer = Timer.scheduledTimer(
-      withTimeInterval: 1,
-      repeats: true
-    ) { [weak self] _ in
-      guard let self = self else { return }
-      self.currentRecordingTime += 1
-      if self.currentRecordingTime >= self.maxRecordingDuration {
-        self.stop()
-      }
-        self.emitStatus(.progress(self.currentRecordingTime))
-    }
-  }
-
-  /// 停止 Engine / 计时器 / 音频会话
-  private func cleanup() {
-    recordingTimer?.invalidate()
-    audioFile = nil
-    recordingFileURL = nil
-    recordingStartTime = nil
-    try? AVAudioSession.sharedInstance().setActive(false, options: [.notifyOthersOnDeactivation])
-  }
-}
-
-extension AudioRecorder {
-  /// 录音输出目录，默认在系统 tmp，可自定义
-  private func createFileDirectory() {
-    if FileManager.default.fileExists(atPath: saveDirectory.path) { return }
-    do {
-      print("创建音频保存目录... ")
-      try FileManager.default.createDirectory(
-        at: saveDirectory,
-        withIntermediateDirectories: true,
-        attributes: [
-          // 设置目录不备份到 iCloud（可选）
-          .protectionKey: FileProtectionType.completeUntilFirstUserAuthentication
-        ]
-      )
-    } catch {
-      print("目录创建失败: \(error.localizedDescription)")
-      // 抛出错误或使用备用目录
-      assertionFailure("必须处理目录创建失败的情况")
-    }
-  }
-
-  /// 设置为录音模式，允许外放和蓝牙耳机
-  private func configureSession() throws {
-    let session = AVAudioSession.sharedInstance()
-    try session.setCategory(.playAndRecord, mode: .measurement, options: [.defaultToSpeaker, .allowBluetoothHFP])
-    try session.setActive(true, options: .notifyOthersOnDeactivation)
-  }
-
-  /// 清空旧的 tap，并安装新的 PCM tap，顺便准备写入文件
-  private func prepareEngine(for fileURL: URL) throws {
-    if audioEngine.isRunning {
-      audioEngine.stop()
-    }
-    audioEngine.reset()
-
-    let inputNode = audioEngine.inputNode
-    inputNode.removeTap(onBus: 0)
-
-    let inputFormat = inputNode.outputFormat(forBus: 0)
-    self.inputFormat = inputFormat
-
+    let inputFormat = await driver.currentInputFormat()
     guard AVAudioFormat(settings: format.settings) != nil else {
       throw RecorderError.invalidFormat
     }
+
     audioFile = try AVAudioFile(
       forWriting: fileURL,
       settings: format.settings,
       commonFormat: inputFormat.commonFormat,
       interleaved: inputFormat.isInterleaved
     )
-
-    inputNode.installTap(onBus: 0, bufferSize: 2048, format: inputFormat) { [weak self] buffer, _ in
-      guard let chunk = AudioRecorder.makeRealtimeChunk(from: buffer) else { return }
-      Task { @MainActor [weak self] in
-        self?.handleIncomingChunk(chunk)
+  
+    try await driver.startRecording { [weak self] chunk in
+      guard let self else { return }
+      Task(priority: .utility) { [weak self] in
+        guard let self else { return }
+        await self.processIncomingChunk(chunk)
       }
     }
+
+    recordingStartTime = Date()
+    currentRecordingTime = 0
+    isRunning = true
+    emitStatus(.starting)
+    startProgressTask()
   }
 
-  /// 主线程调度：在实时线程复制 PCM 后，将 chunk 投递到串行队列。
-  @MainActor
-  private func handleIncomingChunk(_ chunk: RealtimeAudioChunk) {
-    streamingQueue.async { [weak self] in
-      guard let self = self else { return }
-      self.handlePowerUpdate(from: chunk)
-      self.handleStreaming(chunk)
-      self.handleFileWrite(with: chunk)
-      self.enforceDurationLimitIfNeeded()
+  public func stop() async {
+    guard isRunning else { return }
+    isRunning = false
+    if let driver = engineDriver {
+      await driver.stopRecording()
     }
+    await finalizeRecording(sendCompletion: true)
   }
-  
-  /// 将当前 chunk 发给实时翻译/波形等订阅者
-  private func handleStreaming(_ chunk: RealtimeAudioChunk) {
-    realtimeChunkSubject.send(chunk)
+
+  public func cancel() async {
+    guard isRunning else { return }
+    isRunning = false
+    if let driver = engineDriver {
+      await driver.stopRecording()
+    }
+    if let recordingFileURL {
+      try? FileManager.default.removeItem(at: recordingFileURL)
+    }
+    await finalizeRecording(sendCompletion: false)
+    emitStatus(.cancel)
   }
-  
-  /// 把 chunk 转回 PCM buffer，同步写入文件
-  private func handleFileWrite(with chunk: RealtimeAudioChunk) {
+
+  // MARK: - Chunk Handling
+
+  private func processIncomingChunk(_ chunk: RealtimeAudioChunk) async {
+    guard isRunning else { return }
+    emitRealtimeChunk(chunk)
+    emitPower(from: chunk)
+    await writeChunkToFile(chunk)
+    await enforceDurationLimitIfNeeded()
+  }
+
+  private func writeChunkToFile(_ chunk: RealtimeAudioChunk) async {
     guard
       let audioFile,
       let buffer = chunk.makePCMBuffer()
     else { return }
-    
+
     do {
       try audioFile.write(from: buffer)
     } catch {
       emitStatus(.failure(error))
-      cancel()
+      await cancel()
     }
   }
-  
-  /// 计算平均/峰值功率（dB）
-  private func handlePowerUpdate(from chunk: RealtimeAudioChunk) {
+
+  private func enforceDurationLimitIfNeeded() async {
+    guard let start = recordingStartTime else { return }
+    let elapsed = Date().timeIntervalSince(start)
+    if elapsed >= maxRecordingDuration {
+      await stop()
+    }
+  }
+
+  // MARK: - Progress Tracking
+
+  private func startProgressTask() {
+    progressTask?.cancel()
+    progressTask = Task { [weak self] in
+      guard let self else { return }
+      await self.progressLoop()
+    }
+  }
+
+  private func progressLoop() async {
+    while !Task.isCancelled {
+      try? await Task.sleep(nanoseconds: 1_000_000_000)
+      await updateProgress()
+    }
+  }
+
+  private func updateProgress() async {
+    guard isRunning else { return }
+    currentRecordingTime += 1
+    emitStatus(.progress(currentRecordingTime))
+    if currentRecordingTime >= maxRecordingDuration {
+      await stop()
+    }
+  }
+
+  // MARK: - Finalize
+
+  private func finalizeRecording(sendCompletion: Bool) async {
+    progressTask?.cancel()
+    progressTask = nil
+    let finalURL = recordingFileURL
+    recordingStartTime = nil
+    currentRecordingTime = 0
+    audioFile = nil
+    recordingFileURL = nil
+
+    if sendCompletion, let finalURL {
+      emitStatus(.completion(saveURL: finalURL))
+    }
+  }
+
+  private func createFileDirectory() throws {
+    if FileManager.default.fileExists(atPath: saveDirectory.path) { return }
+    try FileManager.default.createDirectory(
+      at: saveDirectory,
+      withIntermediateDirectories: true,
+      attributes: nil
+    )
+  }
+
+  private func makeRecordingURL() -> URL {
+    let fileName = "recording_\(Int(Date().timeIntervalSince1970)).\(format.rawValue)"
+    return saveDirectory.appendingPathComponent(fileName)
+  }
+
+  private func ensureRecordPermission() async throws {
+    let permission = await MainActor.run { AVAudioSession.sharedInstance().recordPermission }
+    switch permission {
+    case .granted:
+      return
+    case .denied:
+      throw RecorderError.permissionDenied
+    case .undetermined:
+      let granted = await withCheckedContinuation { continuation in
+        Task { @MainActor in
+          AVAudioSession.sharedInstance().requestRecordPermission { granted in
+            continuation.resume(returning: granted)
+          }
+        }
+      }
+      guard granted else { throw RecorderError.permissionDenied }
+    @unknown default:
+      throw RecorderError.permissionDenied
+    }
+  }
+
+  // MARK: - Emit Helpers
+
+  private func emitStatus(_ status: Status) {
+    for continuation in statusContinuations.values {
+      continuation.yield(status)
+    }
+  }
+
+  private func emitPower(from chunk: RealtimeAudioChunk) {
+    let power = calculatePower(from: chunk)
+    for continuation in powerContinuations.values {
+      continuation.yield(power)
+    }
+  }
+
+  private func emitRealtimeChunk(_ chunk: RealtimeAudioChunk) {
+    for continuation in chunkContinuations.values {
+      continuation.yield(chunk)
+    }
+  }
+
+  private func calculatePower(from chunk: RealtimeAudioChunk) -> Power {
     let bytesPerSample = chunk.sampleFormat.bytesPerSample
     let totalSamples = chunk.data.count / bytesPerSample
     guard totalSamples > 0 else {
-      emitPower(.init(average: -160, peak: -160))
-      return
+      return Power(average: -160, peak: -160)
     }
-    
+
     var rms: Double = 0
     var peak: Double = 0
-    
+
     chunk.data.withUnsafeBytes { rawBuffer in
       switch chunk.sampleFormat {
       case .float32:
@@ -368,38 +396,22 @@ extension AudioRecorder {
         }
       }
     }
-    
+
     rms = sqrt(rms / Double(totalSamples))
     let averagePower = Float(20 * log10(max(rms, Double(Float.ulpOfOne))))
     let peakPower = Float(20 * log10(max(peak, Double(Float.ulpOfOne))))
-    emitPower(.init(average: averagePower, peak: peakPower))
-  }
-  
-  private func enforceDurationLimitIfNeeded() {
-    guard let start = recordingStartTime else { return }
-    let elapsed = Date().timeIntervalSince(start)
-    if elapsed >= maxRecordingDuration {
-      DispatchQueue.main.async { [weak self] in
-        self?.stop()
-      }
-    }
-  }
-
-  private func finishRecording(sendCompletion: Bool) {
-    let finalURL = recordingFileURL
-    cleanup()
-    guard sendCompletion, let url = finalURL else { return }
-    emitStatus(.completion(saveURL: url))
+    return Power(average: averagePower, peak: peakPower)
   }
 }
 
+// MARK: - Buffer Helpers
+
 private extension AVAudioPCMBuffer {
-  /// 将 AVAudioPCMBuffer 拷贝为 Data，并附带采样格式信息，避免直接共享底层内存。
-  func makePCMData() -> (data: Data, format: AudioRecorder.SampleFormat)? {
+  nonisolated func makePCMData() -> (data: Data, format: AudioRecorder.SampleFormat)? {
     let channels = Int(format.channelCount)
     let frames = Int(frameLength)
     guard frames > 0 else { return nil }
-    
+
     switch format.commonFormat {
     case .pcmFormatFloat32:
       guard let channelData = floatChannelData else { return nil }
@@ -432,10 +444,10 @@ private extension AVAudioPCMBuffer {
 }
 
 extension AudioRecorder.RealtimeAudioChunk {
-  func makePCMBuffer() -> AVAudioPCMBuffer? {
+  nonisolated func makePCMBuffer() -> AVAudioPCMBuffer? {
     let channelCount = Int(channelCount)
     guard channelCount > 0 else { return nil }
-    
+
     let commonFormat: AVAudioCommonFormat
     switch sampleFormat {
     case .float32:
@@ -443,25 +455,25 @@ extension AudioRecorder.RealtimeAudioChunk {
     case .int16:
       commonFormat = .pcmFormatInt16
     }
-    
+
     let totalSamples = data.count / sampleFormat.bytesPerSample
     guard totalSamples > 0 else { return nil }
     let frameCount = totalSamples / channelCount
-    
+
     guard let format = AVAudioFormat(
       commonFormat: commonFormat,
       sampleRate: sampleRate,
       channels: self.channelCount,
       interleaved: false
     ) else { return nil }
-    
+
     guard let buffer = AVAudioPCMBuffer(
       pcmFormat: format,
       frameCapacity: AVAudioFrameCount(frameCount)
     ) else { return nil }
-    
+
     buffer.frameLength = AVAudioFrameCount(frameCount)
-    
+
     switch sampleFormat {
     case .float32:
       guard let channelData = buffer.floatChannelData else { return nil }
@@ -486,12 +498,12 @@ extension AudioRecorder.RealtimeAudioChunk {
         }
       }
     }
-    
+
     return buffer
   }
 }
 
-// MARK: - Helper Builders
+// MARK: - Helpers
 
 private extension AudioRecorder {
   static func makeRealtimeChunk(from buffer: AVAudioPCMBuffer) -> RealtimeAudioChunk? {
@@ -507,18 +519,84 @@ private extension AudioRecorder {
   }
 }
 
-// MARK: - Main-thread emit helpers
+// MARK: - Audio Engine Driver
+private final class AudioEngineDriver {
+  private let audioEngine = AVAudioEngine()
+  private var chunkHandler: (@Sendable (AudioRecorder.RealtimeAudioChunk) -> Void)?
 
-private extension AudioRecorder {
-  func emitStatus(_ status: Status) {
-    DispatchQueue.main.async { [weak self] in
-      self?.statusChangedSubject.send(status)
-    }
+  func currentInputFormat() -> AVAudioFormat {
+    audioEngine.inputNode.outputFormat(forBus: 0)
   }
   
-  func emitPower(_ power: Power) {
-    DispatchQueue.main.async { [weak self] in
-      self?.powerUpdatedSubject.send(power)
+//  func startRecording() throws {
+//    try configureSession()
+//    audioEngine.stop()
+//    audioEngine.reset()
+//
+//    let inputNode = audioEngine.inputNode
+//    inputNode.removeTap(onBus: 0)
+//
+//    let inputFormat = inputNode.outputFormat(forBus: 0)
+//
+//    // Capture handler locally to avoid accessing @MainActor property from audio realtime thread
+//    let capturedHandler = self.chunkHandler
+//      
+//    inputNode.installTap(onBus: 0, bufferSize: 2048, format: inputFormat) { buffer, _ in
+//      guard
+//        let handler = capturedHandler,
+//        let chunk = AudioRecorder.makeRealtimeChunk(from: buffer)
+//      else { return }
+//      handler(chunk)
+//    }
+//    
+//    audioEngine.prepare()
+//    try audioEngine.start()
+//  }
+
+  func startRecording(
+    chunkHandler: @escaping @Sendable (AudioRecorder.RealtimeAudioChunk) -> Void
+  ) throws {
+    self.chunkHandler = chunkHandler
+
+    try configureSession()
+
+    audioEngine.stop()
+    audioEngine.reset()
+
+    let inputNode = audioEngine.inputNode
+    inputNode.removeTap(onBus: 0)
+
+    let inputFormat = inputNode.outputFormat(forBus: 0)
+
+    // Capture handler locally to avoid accessing @MainActor property from audio realtime thread
+    let capturedHandler = self.chunkHandler
+      
+    inputNode.installTap(onBus: 0, bufferSize: 2048, format: inputFormat) { buffer, _ in
+      guard
+        let handler = capturedHandler,
+        let chunk = AudioRecorder.makeRealtimeChunk(from: buffer)
+      else { return }
+      handler(chunk)
     }
+    
+    audioEngine.prepare()
+    try audioEngine.start()
+  }
+
+  func stopRecording() {
+    audioEngine.stop()
+    audioEngine.inputNode.removeTap(onBus: 0)
+    chunkHandler = nil
+    try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
+  }
+
+  private func configureSession() throws {
+    let session = AVAudioSession.sharedInstance()
+    try session.setCategory(
+      .playAndRecord,
+      mode: .measurement,
+      options: [.defaultToSpeaker, .allowBluetoothHFP]
+    )
+    try session.setActive(true, options: .notifyOthersOnDeactivation)
   }
 }

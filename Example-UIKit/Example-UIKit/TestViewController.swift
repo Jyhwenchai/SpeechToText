@@ -8,7 +8,6 @@
 //
 
 import UIKit
-import Combine
 import AVFoundation
 import SpeechToTextKit
 
@@ -26,9 +25,9 @@ final class TestViewController: UIViewController {
     inputSource: .external
   )
 
-  private var cancellables = Set<AnyCancellable>()
-  private var realtimeChunkCancellable: AnyCancellable?
-
+  private var fileStatusTask: Task<Void, Never>?
+  private var streamingStatusTask: Task<Void, Never>?
+  private var realtimeChunkTask: Task<Void, Never>?
   private var isRecordingForTranscription = false
   private var isRealtimeRunning = false
 
@@ -154,10 +153,16 @@ final class TestViewController: UIViewController {
   override func viewDidLoad() {
     super.viewDidLoad()
     title = "Test Recorder"
-    view.backgroundColor = .systemBackground
+    view.backgroundColor = .white
     setupLayout()
     bindRecorders()
     configureRealtimeCallbacks()
+  }
+  
+  deinit {
+    fileStatusTask?.cancel()
+    streamingStatusTask?.cancel()
+    realtimeChunkTask?.cancel()
   }
 }
 
@@ -242,19 +247,35 @@ private extension TestViewController {
   }
 
   func bindRecorders() {
-    fileRecorder.statusChangedPublisher
-      .receive(on: DispatchQueue.main)
-      .sink { [weak self] status in
-        self?.handleFileRecorderStatus(status)
+    fileStatusTask = Task { [weak self] in
+      guard let self else { return }
+      let stream = await self.fileRecorder.statusUpdates()
+      for await status in stream {
+        await MainActor.run {
+          self.handleFileRecorderStatus(status)
+        }
       }
-      .store(in: &cancellables)
-
-    streamingRecorder.statusChangedPublisher
-      .receive(on: DispatchQueue.main)
-      .sink { [weak self] status in
-        self?.handleStreamingRecorderStatus(status)
+    }
+    
+    streamingStatusTask = Task { [weak self] in
+      guard let self else { return }
+      let stream = await self.streamingRecorder.statusUpdates()
+      for await status in stream {
+        await MainActor.run {
+          self.handleStreamingRecorderStatus(status)
+        }
       }
-      .store(in: &cancellables)
+    }
+    
+    realtimeChunkTask = Task { [weak self] in
+      guard let self else { return }
+      let stream = await self.streamingRecorder.realtimeChunks()
+      for await chunk in stream {
+        await MainActor.run {
+          self.handleRealtimeChunk(chunk)
+        }
+      }
+    }
   }
 
   func configureRealtimeCallbacks() {
@@ -297,26 +318,37 @@ private extension TestViewController {
     transcriptionStatusLabel.textColor = .systemBlue
     transcriptionStatusLabel.text = "录音结束后将自动开始转写..."
     updateTranscriptionResult(text: nil)
+    recordStatusLabel.textColor = .systemBlue
+    recordStatusLabel.text = "🎙️ 正在准备录音..."
 
-    do {
-      try fileRecorder.start()
-      isRecordingForTranscription = true
-      recordButton.setTitle("停止录音并转写", for: .normal)
-      recordButton.backgroundColor = UIColor.systemGray
-      recordStatusLabel.textColor = .systemBlue
-      recordStatusLabel.text = "🎙️ 正在准备录音..."
-    } catch {
-      isRecordingForTranscription = false
-      recordStatusLabel.textColor = .systemRed
-      recordStatusLabel.text = "无法开始录音：\(error.localizedDescription)"
+    Task { 
+      do {
+        try await self.fileRecorder.start()
+        await MainActor.run {
+          self.isRecordingForTranscription = true
+          self.recordButton.setTitle("停止录音并转写", for: .normal)
+          self.recordButton.backgroundColor = UIColor.systemGray
+          self.recordStatusLabel.textColor = .systemBlue
+          self.recordStatusLabel.text = "🎙️ 正在准备录音..."
+        }
+      } catch {
+        await MainActor.run {
+          self.isRecordingForTranscription = false
+          self.recordStatusLabel.textColor = .systemRed
+          self.recordStatusLabel.text = "无法开始录音：\(error.localizedDescription)"
+        }
+      }
     }
   }
 
   func stopFileRecordingTest() {
-    fileRecorder.stop()
     recordButton.isEnabled = false
     recordStatusLabel.textColor = .secondaryLabel
     recordStatusLabel.text = "正在停止录音..."
+    Task { [weak self] in
+      guard let self else { return }
+      await self.fileRecorder.stop()
+    }
   }
 
   func handleFileRecorderStatus(_ status: AudioRecorder.Status) {
@@ -397,20 +429,18 @@ private extension TestViewController {
     realtimeStatusLabel.textColor = .systemBlue
     realtimeStatusLabel.text = "正在启动实时翻译..."
     updateRealtimeResult(text: nil)
-
-    Task { @MainActor [weak self] in
-      guard let self else { return }
+//Task { [weak self] in
+//      guard let self else { return }
       do {
-        try await self.realtimeTranslator.start()
-
-        self.realtimeChunkCancellable?.cancel()
-        self.realtimeChunkCancellable = self.streamingRecorder.realtimeChunkPublisher
-          .receive(on: DispatchQueue.main)
-          .sink { [weak self] chunk in
-            self?.handleRealtimeChunk(chunk)
-          }
-
-        try self.streamingRecorder.start()
+         let translator = RealtimeSpeechTranslator(
+          config: RecognitionConfig(locale: Locale(identifier: "zh-CN"), taskHint: .dictation),
+          permissionManager: permissionManager
+        )
+        self.realtimeTranslator = translator
+        Task {
+          try await translator.start()
+          try await self.streamingRecorder.start()
+        }
 
         self.isRealtimeRunning = true
         self.realtimeButton.isEnabled = true
@@ -424,14 +454,33 @@ private extension TestViewController {
         self.realtimeButton.isEnabled = true
         self.presentRealtimeError(.underlying(message: error.localizedDescription))
       }
-    }
+//    }
+//    Task { [weak self] in
+//      guard let self else { return }
+//      do {
+//        try await self.realtimeTranslator.start()
+//        try await self.streamingRecorder.start()
+//
+//        self.isRealtimeRunning = true
+//        self.realtimeButton.isEnabled = true
+//        self.realtimeButton.setTitle("停止实时翻译", for: .normal)
+//        self.realtimeStatusLabel.textColor = .systemGreen
+//        self.realtimeStatusLabel.text = "🎧 正在录音，开口说话吧"
+//      } catch let error as RecognitionError {
+//        self.realtimeButton.isEnabled = true
+//        self.presentRealtimeError(error)
+//      } catch {
+//        self.realtimeButton.isEnabled = true
+//        self.presentRealtimeError(.underlying(message: error.localizedDescription))
+//      }
+//    }
   }
 
   func stopRealtimeTest() {
-    streamingRecorder.stop()
+    Task {
+      await streamingRecorder.stop()
+    }
     realtimeTranslator.stop()
-    realtimeChunkCancellable?.cancel()
-    realtimeChunkCancellable = nil
 
     isRealtimeRunning = false
     realtimeButton.isEnabled = true
@@ -457,7 +506,7 @@ private extension TestViewController {
   }
 
   func handleRealtimeChunk(_ chunk: AudioRecorder.RealtimeAudioChunk) {
-    guard let buffer = chunk.makePCMBuffer() else { return }
+    guard isRealtimeRunning, let buffer = chunk.makePCMBuffer() else { return }
     realtimeTranslator.appendExternalBuffer(buffer)
   }
 

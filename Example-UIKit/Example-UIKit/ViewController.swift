@@ -6,7 +6,6 @@
 //
 
 import AVFoundation
-import Combine
 import SpeechToTextKit
 import UIKit
 import UniformTypeIdentifiers
@@ -24,8 +23,8 @@ class ViewController: UIViewController {
     inputSource: .external
   )
   
-  private var realtimeChunkCancellable: AnyCancellable?
-  private var realtimeStatusCancellable: AnyCancellable?
+  private var recorderStatusTask: Task<Void, Never>?
+  private var recorderChunkTask: Task<Void, Never>?
   
   private var isProcessing = false
   private var currentResult: RecognitionResult?
@@ -279,6 +278,11 @@ class ViewController: UIViewController {
       print(result.formattedText)
     }
   }
+  
+  deinit {
+    recorderStatusTask?.cancel()
+    recorderChunkTask?.cancel()
+  }
 
   override func viewDidLayoutSubviews() {
     super.viewDidLayoutSubviews()
@@ -324,12 +328,26 @@ class ViewController: UIViewController {
       self?.presentRealtimeError(recognitionError)
     }
     
-    realtimeStatusCancellable = audioRecorder.statusChangedPublisher
-      .receive(on: DispatchQueue.main)
-      .sink { [weak self] status in
-        self?.handleRecorderStatus(status)
+    recorderStatusTask = Task { [weak self] in
+      guard let self else { return }
+      let stream = await self.audioRecorder.statusUpdates()
+      for await status in stream {
+        await MainActor.run {
+          self.handleRecorderStatus(status)
+        }
       }
+    }
     
+    recorderChunkTask = Task { [weak self] in
+      guard let self else { return }
+      let stream = await self.audioRecorder.realtimeChunks()
+      for await chunk in stream {
+        await MainActor.run {
+          self.handleRealtimeChunk(chunk)
+        }
+      }
+    }
+
     updateRealtimeUI(status: "点击下方按钮开始录音并实时翻译")
   }
 
@@ -545,12 +563,10 @@ class ViewController: UIViewController {
     // Update ScrollView content size
     scrollView.contentSize = CGSize(width: width, height: yOffset)
   }
-  
+
   override func viewWillDisappear(_ animated: Bool) {
     super.viewWillDisappear(animated)
     stopRealtimeTranslation()
-    realtimeStatusCancellable?.cancel()
-    realtimeStatusCancellable = nil
   }
 
   // MARK: - Permission Management
@@ -754,16 +770,8 @@ class ViewController: UIViewController {
     Task { @MainActor [weak self] in
       guard let self else { return }
       do {
-        try await realtimeTranslator.start()
-        
-        realtimeChunkCancellable?.cancel()
-        realtimeChunkCancellable = audioRecorder.realtimeChunkPublisher
-          .receive(on: DispatchQueue.main)
-          .sink { [weak self] chunk in
-            self?.handleRealtimeChunk(chunk)
-          }
-        
-        try audioRecorder.start()
+//        try await realtimeTranslator.start()
+        try await audioRecorder.start()
         
         self.isRealtimeRunning = true
         self.realtimeToggleButton.isEnabled = true
@@ -781,16 +789,16 @@ class ViewController: UIViewController {
   }
   
   private func stopRealtimeTranslation() {
-    audioRecorder.stop()
+    Task {
+      await audioRecorder.stop()
+    }
     realtimeTranslator.stop()
-    realtimeChunkCancellable?.cancel()
-    realtimeChunkCancellable = nil
     isRealtimeRunning = false
     updateRealtimeUI(status: "已停止，点击开始重新录音", textColor: .secondaryLabel)
   }
   
   private func handleRealtimeChunk(_ chunk: AudioRecorder.RealtimeAudioChunk) {
-    guard let buffer = chunk.makePCMBuffer() else { return }
+    guard isRealtimeRunning, let buffer = chunk.makePCMBuffer() else { return }
     realtimeTranslator.appendExternalBuffer(buffer)
   }
   

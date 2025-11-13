@@ -5,8 +5,7 @@ import Speech
 
 /// 实时语音翻译器：支持麦克风或外部 PCM 源
 @available(iOS 13.0, *)
-@MainActor
-public final class RealtimeSpeechTranslator: NSObject, SpeechRealtimeTranslating {
+public final class RealtimeSpeechTranslator: SpeechRealtimeTranslating {
   
   public typealias ResultHandler = SpeechRealtimeTranslating.ResultHandler
   

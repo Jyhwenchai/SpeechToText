@@ -12,7 +12,7 @@ import Speech
 
 /// 语音识别权限管理器（iOS 专属）
 @available(iOS 13.0, *)
-public actor SpeechPermissionManager: SpeechPermissionManaging {
+public final class SpeechPermissionManager: SpeechPermissionManaging {
   
   public init() {}
   

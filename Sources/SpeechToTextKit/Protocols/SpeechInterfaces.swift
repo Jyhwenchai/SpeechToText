@@ -56,8 +56,7 @@ public protocol SpeechFileTranscribing: Sendable {
 #if os(iOS) && canImport(Speech)
 /// 实时语音转写协议（仅 iOS 可用）
 @available(iOS 13.0, *)
-@MainActor
-public protocol SpeechRealtimeTranslating: AnyObject {
+public protocol SpeechRealtimeTranslating {
   /// 实时识别回调
   typealias ResultHandler = (RecognitionResult, Bool) -> Void
   
